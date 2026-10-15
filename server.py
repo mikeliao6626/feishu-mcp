@@ -276,7 +276,13 @@ def feishu_search_docs(keyword: str, page_size: int = 10) -> str:
 async def health_check(request: Request) -> Response:
     return JSONResponse({"status": "ok", "service": "feishu-mcp"})
 
-
+def build_app():
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+    app = mcp.streamable_http_app()
+    # Allow all hosts (Railway proxy uses dynamic hostnames)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
+    app.add_middleware(BearerAuthMiddleware)
+    return app
 # ---------------------------------------------------------------- Auth + serve
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Require Authorization: Bearer <MCP_AUTH_TOKEN> on all routes except /health."""
