@@ -1,0 +1,1 @@
+{"$schema":"https://railway.app/railway.schema.json","build":{"buildCommand":"pip install -r requirements.txt","builder":"NIXPACKS"},"deploy":{"healthcheckPath":"/health","healthcheckTimeout":30,"restartPolicyMaxRetries":10,"restartPolicyType":"ON_FAILURE","startCommand":"python server.py"}}
