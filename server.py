@@ -21,6 +21,7 @@ import urllib.parse
 import urllib.error
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -295,10 +296,14 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
 
 def build_app():
-    from starlette.middleware.trustedhost import TrustedHostMiddleware
-    app = mcp.streamable_http_app()
-    # Allow all hosts (Railway proxy uses dynamic hostnames)
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
+    # Disable MCP SDK's DNS-rebinding protection: Railway's reverse proxy
+    # already validates the Host header, and the SDK's default localhost-only
+    # allowlist rejects every request behind a real hostname (421 Invalid Host header).
+    app = mcp.streamable_http_app(
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=False
+        )
+    )
     app.add_middleware(BearerAuthMiddleware)
     return app
 
