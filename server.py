@@ -168,21 +168,79 @@ def feishu_create_doc(title: str, folder_token: str = "") -> str:
     )
 
 
+def _block_to_text(block: dict) -> str:
+    """Extract readable text from a docx block (any type)."""
+    bt = block.get("block_type")
+    field_map = {
+        2: "text", 3: "heading1", 4: "heading2", 5: "heading3",
+        6: "heading4", 7: "heading5", 8: "heading6", 9: "heading7",
+        10: "heading8", 11: "heading9", 12: "bullet", 13: "ordered",
+        14: "code", 15: "quote", 22: "todo",
+    }
+    field = field_map.get(bt)
+    prefix = ""
+    if bt in (3, 4, 5, 6, 7, 8, 9, 10, 11):
+        prefix = "#" * (bt - 2) + " "
+    elif bt == 12:
+        prefix = "- "
+    elif bt == 13:
+        prefix = "1. "
+    elif bt == 15:
+        prefix = "> "
+    elif bt == 22:
+        done = block.get("todo", {}).get("style", {}).get("done", False)
+        prefix = "[x] " if done else "[ ] "
+    if not field or field not in block:
+        return ""
+    parts = []
+    for el in block[field].get("elements", []):
+        tr = el.get("text_run")
+        if tr and tr.get("content"):
+            parts.append(tr["content"])
+    text = "".join(parts).strip()
+    return prefix + text if text else ""
+
+
 @mcp.tool()
-def feishu_read_doc(doc_id_or_url: str) -> str:
-    """Read a Feishu document's content as plain text.
+def feishu_read_doc(doc_id_or_url: str, page_token: str = "",
+                    page_size: int = 50) -> str:
+    """Read a Feishu document's content as plain text (paginated).
+
+    For large documents, call repeatedly with the returned next_page_token
+    until it is empty.
 
     Args:
         doc_id_or_url: Document ID or full URL
+        page_token: Pass next_page_token from previous call for next page;
+            empty for first page
+        page_size: Blocks per page (1-100, default 50)
     Returns:
-        JSON with document title and text content
+        JSON with document_id, content text, next_page_token, has_more
     """
     doc_id = _doc_id(doc_id_or_url)
-    data = feishu.request("GET", f"/docx/v1/documents/{doc_id}/raw_content")
+    page_size = max(1, min(int(page_size or 50), 100))
+    params = {"page_size": page_size}
+    if page_token:
+        params["page_token"] = page_token
+    data = feishu.request(
+        "GET", f"/docx/v1/documents/{doc_id}/blocks/{doc_id}/children",
+        params=params)
     if data.get("code") != 0:
         return _err(f"read failed: {data.get('msg')} ({data.get('code')})")
-    content = data.get("data", {}).get("content", "")
-    return _ok({"ok": True, "document_id": doc_id, "content": content})
+    d = data.get("data", {})
+    lines = []
+    for block in d.get("items", []):
+        t = _block_to_text(block)
+        if t:
+            lines.append(t)
+    return _ok({
+        "ok": True,
+        "document_id": doc_id,
+        "content": "\n".join(lines),
+        "next_page_token": d.get("page_token", "") or "",
+        "has_more": d.get("has_more", False),
+        "blocks_returned": len(d.get("items", [])),
+    })
 
 
 @mcp.tool()

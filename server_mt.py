@@ -203,26 +203,86 @@ def feishu_create_doc(api_key: str, title: str, folder_token: str = "") -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+def _block_to_text(block: dict) -> str:
+    """Extract readable text from a docx block (any type)."""
+    bt = block.get("block_type")
+    # Map block types to their content field names
+    field_map = {
+        2: "text", 3: "heading1", 4: "heading2", 5: "heading3",
+        6: "heading4", 7: "heading5", 8: "heading6", 9: "heading7",
+        10: "heading8", 11: "heading9", 12: "bullet", 13: "ordered",
+        14: "code", 15: "quote", 22: "todo",
+    }
+    field = field_map.get(bt)
+    prefix = ""
+    if bt in (3, 4, 5, 6, 7, 8, 9, 10, 11):
+        prefix = "#" * (bt - 2) + " "
+    elif bt == 12:
+        prefix = "- "
+    elif bt == 13:
+        prefix = "1. "
+    elif bt == 15:
+        prefix = "> "
+    elif bt == 22:
+        done = block.get("todo", {}).get("style", {}).get("done", False)
+        prefix = "[x] " if done else "[ ] "
+    if not field or field not in block:
+        return ""
+    elements = block[field].get("elements", [])
+    parts = []
+    for el in elements:
+        tr = el.get("text_run")
+        if tr and tr.get("content"):
+            parts.append(tr["content"])
+        # mention_doc, mention_user etc. - use text_run fallback
+    text = "".join(parts).strip()
+    return prefix + text if text else ""
+
+
 @mcp.tool()
-def feishu_read_doc(api_key: str, doc_id_or_url: str) -> str:
-    """Read a Feishu document's content.
+def feishu_read_doc(api_key: str, doc_id_or_url: str, page_token: str = "",
+                    page_size: int = 50) -> str:
+    """Read a Feishu document's content (paginated - large docs won't truncate).
+
+    For large documents, call repeatedly with the returned next_page_token
+    until it is empty.
 
     Args:
         api_key: Your personal API key from OAuth authorization
         doc_id_or_url: Document ID or full URL
+        page_token: Pass the next_page_token from the previous call to get
+            the next page; leave empty for the first page
+        page_size: Blocks per page (1-100, default 50)
     Returns:
-        JSON with document content
+        JSON with: ok, content (text), next_page_token (empty string when
+        done), blocks_returned
     """
     user, err = require_user(api_key)
     if err:
         return json.dumps({"ok": False, "error": err}, ensure_ascii=False)
-    # Extract doc ID from URL if needed
     doc_id = doc_id_or_url.split("/")[-1].split("?")[0]
-    result = feishu_api(
-        "GET", f"/docx/v1/documents/{doc_id}/raw_content",
-        user["user_access_token"]
-    )
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    page_size = max(1, min(int(page_size or 50), 100))
+    path = (f"/docx/v1/documents/{doc_id}/blocks/{doc_id}/children"
+            f"?page_size={page_size}")
+    if page_token:
+        path += f"&page_token={urllib.parse.quote(page_token)}"
+    result = feishu_api("GET", path, user["user_access_token"])
+    if result.get("code") != 0:
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    data = result.get("data", {})
+    items = data.get("items", [])
+    lines = []
+    for block in items:
+        t = _block_to_text(block)
+        if t:
+            lines.append(t)
+    return json.dumps({
+        "ok": True,
+        "content": "\n".join(lines),
+        "next_page_token": data.get("page_token", "") or "",
+        "has_more": data.get("has_more", False),
+        "blocks_returned": len(items),
+    }, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
