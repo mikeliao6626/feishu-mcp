@@ -94,8 +94,24 @@ def oauth_callback():
     rt = d.get("refresh_token", "")
     exp = int(d.get("expires_in", 0))
     user_info = d.get("user_info", {}) or {}
-    feishu_uid = user_info.get("user_id", "") or d.get("open_id", "")
+    feishu_uid = user_info.get("user_id", "") or d.get("open_id", "") or d.get("user_id", "")
     feishu_name = user_info.get("name", "Unknown")
+
+    # If user_id not in token response, fetch via user_info API
+    if at and not feishu_uid:
+        try:
+            u_req = urllib.request.Request(
+                "https://open.feishu.cn/open-apis/authen/v1/user_info",
+                headers={"Authorization": f"Bearer {at}"},
+                method="GET",
+            )
+            with urllib.request.urlopen(u_req, timeout=15) as u_resp:
+                u_d = json.loads(u_resp.read())
+            u_data = u_d.get("data", {}) or {}
+            feishu_uid = u_data.get("user_id", "") or u_data.get("open_id", "")
+            feishu_name = u_data.get("name", feishu_name)
+        except Exception:
+            pass
 
     if not at or not feishu_uid:
         return "Incomplete token response", 500
