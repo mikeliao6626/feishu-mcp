@@ -7,6 +7,7 @@ Runs alongside the MCP server. Handles:
 - GET /health -> health check
 """
 import os
+import inspect
 import secrets
 import time
 import urllib.parse
@@ -14,6 +15,18 @@ import urllib.request
 import json
 import sqlite3
 from flask import Flask, request, redirect
+
+# Reuse MCP tool functions from the multi-tenant MCP server.
+# Importing server_mt is safe: module-level code only builds the
+# MCPServer object and defines functions; the `__main__` block is guarded.
+from server_mt import (
+    feishu_create_doc,
+    feishu_read_doc,
+    feishu_update_doc,
+    feishu_search_docs,
+    feishu_whoami,
+    get_user_by_api_key,
+)
 
 app = Flask(__name__)
 
@@ -157,6 +170,211 @@ def oauth_callback():
         <p style="color: #888; font-size: 12px;">Token 有效期 2 小时，服务端会自动刷新，无需重复授权。</p>
     </body></html>
     """
+
+
+# --- MCP Streamable HTTP endpoint (JSON-RPC 2.0) ---
+# Exposes the multi-tenant MCP tools over HTTP so AI clients
+# (Doubao, ChatGPT, Claude, ...) can connect without stdio.
+# The user's api_key comes from the HTTP Authorization header
+# ("Bearer fmcp_...") and is injected into tool arguments.
+
+_API_KEY_DESC = ("Your personal API key from OAuth authorization "
+                 "(auto-filled from the HTTP Authorization header)")
+
+MCP_TOOL_SCHEMAS = {
+    "feishu_create_doc": {
+        "description": "Create a new Feishu cloud document (owned by YOU).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": _API_KEY_DESC},
+                "title": {"type": "string", "description": "Document title"},
+                "folder_token": {"type": "string",
+                                 "description": "Optional folder token (empty = root)"},
+            },
+            "required": ["title"],
+        },
+    },
+    "feishu_read_doc": {
+        "description": ("Read a Feishu document's content "
+                        "(paginated - large docs won't truncate)."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": _API_KEY_DESC},
+                "doc_id_or_url": {"type": "string",
+                                  "description": "Document ID or full URL"},
+                "page_token": {"type": "string",
+                               "description": ("Pass the next_page_token from the "
+                                               "previous call to get the next page; "
+                                               "leave empty for the first page")},
+                "page_size": {"type": "integer",
+                              "description": "Blocks per page (1-100, default 50)"},
+            },
+            "required": ["doc_id_or_url"],
+        },
+    },
+    "feishu_update_doc": {
+        "description": "Update a Feishu document (you must have edit permission).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": _API_KEY_DESC},
+                "doc_id_or_url": {"type": "string",
+                                  "description": "Document ID or full URL"},
+                "content": {"type": "string",
+                            "description": "Markdown content to write"},
+                "mode": {"type": "string",
+                         "description": '"append" (add to end) or "overwrite" (replace all)'},
+            },
+            "required": ["doc_id_or_url", "content"],
+        },
+    },
+    "feishu_search_docs": {
+        "description": ("Search Feishu cloud documents by keyword "
+                        "(searches YOUR accessible docs)."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": _API_KEY_DESC},
+                "keyword": {"type": "string", "description": "Search keyword"},
+                "page_size": {"type": "integer",
+                              "description": "Max results (default 10)"},
+            },
+            "required": ["keyword"],
+        },
+    },
+    "feishu_whoami": {
+        "description": "Show who you are authenticated as (for verifying your identity).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "api_key": {"type": "string", "description": _API_KEY_DESC},
+            },
+            "required": [],
+        },
+    },
+}
+
+MCP_TOOL_FUNCS = {
+    "feishu_create_doc": feishu_create_doc,
+    "feishu_read_doc": feishu_read_doc,
+    "feishu_update_doc": feishu_update_doc,
+    "feishu_search_docs": feishu_search_docs,
+    "feishu_whoami": feishu_whoami,
+}
+
+
+def _mcp_extract_api_key():
+    """Extract api_key from HTTP Authorization header ('Bearer fmcp_...')."""
+    auth = request.headers.get("Authorization", "") or ""
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return ""
+
+
+def _mcp_check_api_key(api_key):
+    """Return (ok, message) for the given api_key."""
+    if not api_key:
+        return False, ("Missing api_key: add HTTP header "
+                       "'Authorization: Bearer fmcp_...'")
+    try:
+        user = get_user_by_api_key(api_key)
+    except Exception as e:
+        # DB missing/corrupt: never leak a 500, answer in JSON-RPC
+        return False, f"Auth backend unavailable: {e}"
+    if not user:
+        return False, ("Invalid api_key. "
+                       "Re-authorize at /oauth/authorize to get a new one.")
+    return True, ""
+
+
+def _jsonrpc_error(req_id, code, message):
+    return {"jsonrpc": "2.0", "id": req_id,
+            "error": {"code": code, "message": message}}
+
+
+@app.route("/mcp", methods=["POST"])
+def mcp_streamable_http():
+    try:
+        body = request.get_json(force=True)
+    except Exception:
+        return _jsonrpc_error(None, -32700, "Parse error: invalid JSON"), 200
+    if not isinstance(body, dict):
+        return _jsonrpc_error(None, -32600, "Invalid Request"), 200
+
+    req_id = body.get("id")
+    method = body.get("method", "") or ""
+
+    # Notification: no response body expected
+    if method == "notifications/initialized":
+        return "", 202
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "feishu-docs-mt", "version": "1.0.0"},
+            },
+        }, 200
+
+    # tools/* require a valid api_key from the Authorization header
+    api_key = _mcp_extract_api_key()
+    ok, msg = _mcp_check_api_key(api_key)
+    if not ok:
+        return _jsonrpc_error(req_id, -32000, msg), 200
+
+    if method == "tools/list":
+        tools = [{"name": name, **MCP_TOOL_SCHEMAS[name]}
+                 for name in MCP_TOOL_FUNCS]
+        return {"jsonrpc": "2.0", "id": req_id,
+                "result": {"tools": tools}}, 200
+
+    if method == "tools/call":
+        params = body.get("params") or {}
+        if not isinstance(params, dict):
+            return _jsonrpc_error(req_id, -32602,
+                                  "Invalid params: params must be an object"), 200
+        name = params.get("name", "") or ""
+        arguments = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            return _jsonrpc_error(req_id, -32602,
+                                  "Invalid params: arguments must be an object"), 200
+        func = MCP_TOOL_FUNCS.get(name)
+        if func is None:
+            return _jsonrpc_error(req_id, -32601,
+                                  f"Method not found: {name}"), 200
+        # Inject api_key from the header if the caller didn't provide one
+        arguments = dict(arguments)
+        arguments.setdefault("api_key", api_key)
+        # Drop unknown kwargs so extra client fields can't cause TypeError
+        try:
+            sig_params = inspect.signature(func).parameters
+            arguments = {k: v for k, v in arguments.items()
+                         if k in sig_params}
+        except Exception:
+            pass
+        try:
+            result_text = func(**arguments)
+        except TypeError as e:
+            return _jsonrpc_error(req_id, -32602,
+                                  f"Invalid params: {e}"), 200
+        except Exception as e:
+            return _jsonrpc_error(req_id, -32603,
+                                  f"Internal error: {e}"), 200
+        if not isinstance(result_text, str):
+            result_text = json.dumps(result_text, ensure_ascii=False)
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"content": [{"type": "text", "text": result_text}]},
+        }, 200
+
+    return _jsonrpc_error(req_id, -32601,
+                          f"Method not found: {method}"), 200
 
 
 if __name__ == "__main__":
