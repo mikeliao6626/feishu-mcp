@@ -55,7 +55,7 @@ def oauth_authorize():
         "scope": " ".join(SCOPES),
         "state": secrets.token_urlsafe(16),
     }
-    url = "https://accounts.feishu.cn/open-apis/authen/v2/oauth/authorize?" + \
+    url = "https://accounts.feishu.cn/open-apis/authen/v1/authorize?" + \
           urllib.parse.urlencode(params)
     return redirect(url)
 

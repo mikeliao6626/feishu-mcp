@@ -379,7 +379,7 @@ def get_authorize_url():
         "scope": " ".join(SCOPES),
         "state": "feishu-mcp-mt",
     }
-    return "https://accounts.feishu.cn/open-apis/authen/v2/oauth/authorize?" + \
+    return "https://accounts.feishu.cn/open-apis/authen/v1/authorize?" + \
            urllib.parse.urlencode(params)
 
 
