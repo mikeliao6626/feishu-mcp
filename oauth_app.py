@@ -321,17 +321,18 @@ def mcp_streamable_http():
             },
         }, 200
 
-    # tools/* require a valid api_key from the Authorization header
-    api_key = _mcp_extract_api_key()
-    ok, msg = _mcp_check_api_key(api_key)
-    if not ok:
-        return _jsonrpc_error(req_id, -32000, msg), 200
-
     if method == "tools/list":
+        # tools/list is public (no auth) - clients call this during discovery
         tools = [{"name": name, **MCP_TOOL_SCHEMAS[name]}
                  for name in MCP_TOOL_FUNCS]
         return {"jsonrpc": "2.0", "id": req_id,
                 "result": {"tools": tools}}, 200
+
+    # tools/call requires a valid api_key from the Authorization header
+    api_key = _mcp_extract_api_key()
+    ok, msg = _mcp_check_api_key(api_key)
+    if not ok:
+        return _jsonrpc_error(req_id, -32000, msg), 200
 
     if method == "tools/call":
         params = body.get("params") or {}
