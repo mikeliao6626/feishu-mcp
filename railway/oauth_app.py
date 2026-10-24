@@ -301,14 +301,42 @@ def _jsonrpc_error(req_id, code, message):
             "error": {"code": code, "message": message}}
 
 
+def _mcp_response(obj, status=200):
+    # Streamable HTTP: a client that asks for SSE gets an SSE frame,
+    # everyone else gets plain JSON. Both are spec-valid; choosing by
+    # Accept keeps JSON clients and stricter SSE-only clients (Doubao,
+    # Grok) working on the same endpoint.
+    from flask import Response
+    accept = request.headers.get("Accept", "") or ""
+    if "text/event-stream" in accept:
+        body = "event: message\ndata: " + json.dumps(
+            obj, ensure_ascii=False) + "\n\n"
+        return Response(body, status=status,
+                        mimetype="text/event-stream",
+                        headers={"Cache-Control": "no-cache",
+                                 "X-Accel-Buffering": "no"})
+    return obj, status
+
+
+@app.route("/mcp", methods=["GET"])
+def mcp_get_not_supported():
+    # No server-initiated SSE stream on this stateless service. Answer
+    # 405 as JSON (not Flask's default HTML) so MCP clients fall back
+    # to POST instead of failing on an HTML page.
+    return _jsonrpc_error(None, -32601,
+                          "GET not supported on /mcp, use POST"), 405
+
+
 @app.route("/mcp", methods=["POST"])
 def mcp_streamable_http():
     try:
         body = request.get_json(force=True)
     except Exception:
-        return _jsonrpc_error(None, -32700, "Parse error: invalid JSON"), 200
+        return _mcp_response(
+            _jsonrpc_error(None, -32700, "Parse error: invalid JSON"), 200)
     if not isinstance(body, dict):
-        return _jsonrpc_error(None, -32600, "Invalid Request"), 200
+        return _mcp_response(
+            _jsonrpc_error(None, -32600, "Invalid Request"), 200)
 
     req_id = body.get("id")
     method = body.get("method", "") or ""
@@ -318,43 +346,50 @@ def mcp_streamable_http():
         return "", 202
 
     if method == "initialize":
-        return {
+        # Echo the client's requested protocol version when it sends one:
+        # older clients reject a fixed newer version outright.
+        params0 = body.get("params") or {}
+        pv = (params0.get("protocolVersion")
+              if isinstance(params0, dict) else None) or "2024-11-05"
+        return _mcp_response({
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": pv,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "feishu-docs-mt", "version": "1.0.0"},
             },
-        }, 200
+        }, 200)
 
     if method == "tools/list":
         # tools/list is public (no auth) - clients call this during discovery
         tools = [{"name": name, **MCP_TOOL_SCHEMAS[name]}
                  for name in MCP_TOOL_FUNCS]
-        return {"jsonrpc": "2.0", "id": req_id,
-                "result": {"tools": tools}}, 200
+        return _mcp_response({"jsonrpc": "2.0", "id": req_id,
+                              "result": {"tools": tools}}, 200)
 
     # tools/call requires a valid api_key from the Authorization header
     api_key = _mcp_extract_api_key()
     ok, msg = _mcp_check_api_key(api_key)
     if not ok:
-        return _jsonrpc_error(req_id, -32000, msg), 200
+        return _mcp_response(_jsonrpc_error(req_id, -32000, msg), 200)
 
     if method == "tools/call":
         params = body.get("params") or {}
         if not isinstance(params, dict):
-            return _jsonrpc_error(req_id, -32602,
-                                  "Invalid params: params must be an object"), 200
+            return _mcp_response(_jsonrpc_error(
+                req_id, -32602,
+                "Invalid params: params must be an object"), 200)
         name = params.get("name", "") or ""
         arguments = params.get("arguments") or {}
         if not isinstance(arguments, dict):
-            return _jsonrpc_error(req_id, -32602,
-                                  "Invalid params: arguments must be an object"), 200
+            return _mcp_response(_jsonrpc_error(
+                req_id, -32602,
+                "Invalid params: arguments must be an object"), 200)
         func = MCP_TOOL_FUNCS.get(name)
         if func is None:
-            return _jsonrpc_error(req_id, -32601,
-                                  f"Method not found: {name}"), 200
+            return _mcp_response(_jsonrpc_error(
+                req_id, -32601, f"Method not found: {name}"), 200)
         # Inject api_key from the header if the caller didn't provide one
         arguments = dict(arguments)
         arguments.setdefault("api_key", api_key)
@@ -368,21 +403,21 @@ def mcp_streamable_http():
         try:
             result_text = func(**arguments)
         except TypeError as e:
-            return _jsonrpc_error(req_id, -32602,
-                                  f"Invalid params: {e}"), 200
+            return _mcp_response(_jsonrpc_error(
+                req_id, -32602, f"Invalid params: {e}"), 200)
         except Exception as e:
-            return _jsonrpc_error(req_id, -32603,
-                                  f"Internal error: {e}"), 200
+            return _mcp_response(_jsonrpc_error(
+                req_id, -32603, f"Internal error: {e}"), 200)
         if not isinstance(result_text, str):
             result_text = json.dumps(result_text, ensure_ascii=False)
-        return {
+        return _mcp_response({
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {"content": [{"type": "text", "text": result_text}]},
-        }, 200
+        }, 200)
 
-    return _jsonrpc_error(req_id, -32601,
-                          f"Method not found: {method}"), 200
+    return _mcp_response(_jsonrpc_error(
+        req_id, -32601, f"Method not found: {method}"), 200)
 
 
 if __name__ == "__main__":
