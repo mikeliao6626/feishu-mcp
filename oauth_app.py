@@ -42,6 +42,7 @@ SCOPES = [
     "contact:contact.base:readonly",
     "drive:drive:readonly",
     "docx:document",
+    "docx:document.block:convert",
     "sheets:spreadsheet",
     "wiki:wiki:readonly",
     "offline_access",
